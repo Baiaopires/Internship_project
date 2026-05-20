@@ -219,6 +219,10 @@ At the end of Week 2, a meeting was held with the ISIPCA team to clarify several
 
 **Answer:** The relevant region to capture is the interval around the **highest peak** only. If the sensogram shows two peaks close together, the one with the greater amplitude is the analytically significant one — the other is likely an artefact or a secondary event and should be ignored. The correct approach is therefore to define a **time window centred around the maximum peak** and compute the normalised signature from that interval alone, rather than using all time points. Regarding the binary diode sensor that fires at peak onset — that signal is **not available** to us. The recommended method for defining the peak window is to do it **manually**, using proprietary Aryballe software that localises the peak. This software has not yet been provided to us; its delivery is a pending action item.
 
+<div align="center">
+   <img src="https://github.com/Baiaopires/Internship_project/blob/main/images/sensogram_peak_zoom_mark.png">
+</div>
+
 > **Implication:** The normalised signatures in the current CSV (`7Q27_normalized_signatures.csv`) may not be computed from the optimal signal window. Once the Aryballe software is available, the signatures should be recomputed from the peak-window region. Until then, the existing values are used as targets.
 
 ---
