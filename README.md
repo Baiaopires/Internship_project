@@ -1,5 +1,4 @@
 # E-Nose & Graph Neural Networks for Molecular Property Prediction
-**Internship Progress Log**
 
 ---
 
@@ -205,3 +204,150 @@ The following questions frame the work going forward:
 
 5. **Does representing molecules as graphs preserve enough structural information to outperform handcrafted fingerprints on this regression task?**
    — This is the central question Vinícius is addressing. The GNN pipeline is now built; evaluation and comparison against the fingerprint baselines is the next step.
+
+---
+
+## 6. ISIPCA Meeting — Questions & Answers
+
+At the end of Week 2, a meeting was held with the ISIPCA team to clarify several open questions that had been compiled and formalised into a structured document (`meeting_questions.tex`). The questions covered four domains: signal processing, sensor architecture, dataset size, and the final scientific objective of the project. A critical molecule validation question was also raised. Below are the questions as they were asked, followed by the answers received.
+
+---
+
+### Q1 — What Signal Should We Be Capturing?
+
+**Background:** Looking at the raw sensograms, sensor signals rise continuously toward the end of the analyte phase — meaning the slowly-rising tail dominates the L2-normalised value. The sharp peak that appears mid-run (around index 1450) may carry more chemically specific information but is underweighted in the current normalisation. The sensogram also shows a smaller earlier peak (around index 500). The questions raised were: should we define a time window around the peak instead of using the full signal? Which peak is analytically relevant? Is a binary diode-like signal available to precisely locate the peak? And if not, how should the window be defined?
+
+**Answer:** The relevant region to capture is the interval around the **highest peak** only. If the sensogram shows two peaks close together, the one with the greater amplitude is the analytically significant one — the other is likely an artefact or a secondary event and should be ignored. The correct approach is therefore to define a **time window centred around the maximum peak** and compute the normalised signature from that interval alone, rather than using all time points. Regarding the binary diode sensor that fires at peak onset — that signal is **not available** to us. The recommended method for defining the peak window is to do it **manually**, using proprietary Aryballe software that localises the peak. This software has not yet been provided to us; its delivery is a pending action item.
+
+> **Implication:** The normalised signatures in the current CSV (`7Q27_normalized_signatures.csv`) may not be computed from the optimal signal window. Once the Aryballe software is available, the signatures should be recomputed from the peak-window region. Until then, the existing values are used as targets.
+
+---
+
+### Q2 — 64 Sensors vs. 8
+
+**Background:** The device has 64 sensors in total, but the dataset only contains readings for 8 of them. It was unclear whether this was intentional, what the selection criterion was, and whether the full 64-sensor data could be accessed.
+
+**Answer:** The 64 sensors on the gold film are not 64 distinct peptide types — they are **8 peptide variants, each replicated 8 times** across the surface (8 × 8 = 64 spots). The 8 sensor values in the dataset are therefore already the **averages over each group of 8 replicate spots** for each peptide type. There is no additional information being withheld; the 8 values in the CSV represent the complete, non-redundant signal produced by the device for a given molecule.
+
+> **Implication:** The dataset is complete as-is. There is no richer 64-sensor signal to retrieve. The 8 values are the device's full output, after spatial averaging across replicates.
+
+---
+
+### Q3 — Expected Size of the Full Dataset
+
+**Background:** The current dataset covers only 6 distinct molecules (3 experimental replicates each, giving 18 usable rows after cleaning). It was unclear how many molecules would be available by the end of the internship, whether replicates would be added, and what chemical families would be represented.
+
+**Answer:** ISIPCA currently has only the **18 experiments for the 6 molecules** already in the dataset, and they do not have significant time to run additional experiments in the near future. It is therefore unlikely that the dataset will grow substantially through their experimental pipeline alone by the end of the internship. To address this constraint, ISIPCA suggested that we **go to their laboratory at ISIPCA and run the experiments ourselves**. Each molecule requires 3 experimental runs. The chemical family of the molecules to be tested was not specified at this stage. Additionally, ISIPCA will provide a list of **approximately 800 molecules** they have physically available for experimentation, which will inform which new compounds can be tested.
+
+> **Implication:** Dataset growth is our responsibility to drive. The path forward is to visit ISIPCA, select molecules from their available list, and conduct experiments directly. This also means the final model will need to be designed to handle a potentially still-small dataset, favouring architectures and regularisation strategies that generalise under low-data conditions.
+
+---
+
+### Q4 — Sensor Prediction or Smell Prediction?
+
+**Background:** ISIPCA is both a chemistry research institute and a perfumery school. The project could plausibly aim at predicting raw sensor values (a physico-chemical objective), or at predicting human olfactory perception descriptors such as "floral", "woody", or "citrus" (a perceptual objective), or at a sequential combination of both.
+
+**Answer:** The final objective was not formally specified, but the direction strongly suggested is toward **predicting olfactory/perceptual descriptors** — i.e., predicting what a molecule smells like to a human — rather than stopping at sensor values. The sensor prediction step is understood as an intermediate representation. The broader goal is likely to build a pipeline that goes from molecular structure to perceived smell, which would have direct applications for fragrance design and ingredient evaluation.
+
+> **Implication:** This shapes the long-term architecture of the project. A two-stage pipeline is possible: (1) predict e-nose sensor values from molecular structure, then (2) map those sensor values to olfactory descriptors. Alternatively, the model could be trained end-to-end on odour labels if sufficient labelled data becomes available. This motivates the effort described in Section 7 below to collect odour descriptor data.
+
+---
+
+### Molecule Validation
+
+**Background:** Since the SMILES strings used throughout the pipeline were retrieved automatically from PubChem based on molecule names, their correctness could not be independently verified without chemistry expertise. Errors in SMILES would propagate through the entire pipeline. A particular concern was raised for Ocimene, which has multiple isomers (α, β-cis, β-trans) — PubChem may not return the one actually used in the experiment.
+
+**Answer:** ISIPCA will provide a list of the approximately **800 molecules they have physically available** for experiments. This list will serve as the ground truth for molecule identity validation — the SMILES, CAS numbers, and other identifiers for the molecules we already have can be cross-referenced against this list. In the meantime, the current working task is to search public libraries for **odour descriptor data** for the molecules on that list, to begin building the labelled dataset needed for the perceptual prediction objective.
+
+---
+
+## 7. Building an Odour Descriptor Dataset
+
+Following the ISIPCA meeting, the next concrete step was established: gather odour descriptor labels for the molecules we already have, and prepare infrastructure to extend this to the ~800 molecules ISIPCA will provide. This section documents that process in order.
+
+### Step 1 — Searching for Odour Descriptors for the 6 Existing Molecules
+
+The first task was simply to find published odour descriptors for the 6 molecules already in the e-nose dataset (Ocimene, Δ3-Carene, Linalool, α-Pinene, (S)-Limonene, (R)-Limonene). The primary source used was the **Good Scents Company** website (`thegoodscentscompany.com`), a widely used industry reference that catalogues odour and flavour descriptors for thousands of fragrance molecules.
+
+**Results:**
+
+| Molecule | Found in Good Scents? |
+|---|---|
+| Δ3-Carene | ✓ |
+| Linalool | ✓ |
+| (S)-Limonene | ✓ |
+| (R)-Limonene | ✓ |
+| Ocimene | ✗ |
+| α-Pinene | ✗ |
+
+4 out of 6 molecules had odour descriptors available. Ocimene and α-Pinene were not found, likely because Ocimene's multiple isomers make it hard to resolve unambiguously in the database, and α-Pinene may be listed under a different name variant.
+
+---
+
+### Step 2 — Scraping the Good Scents Company Website
+
+Rather than relying on the version of the Good Scents data available in the `pyrfume` GitHub repository (which was last updated approximately 4 years ago and may be significantly outdated), a decision was made to **scrape the Good Scents website directly** to obtain the most current dataset.
+
+This was implemented in `Dataset_Creation.ipynb`. The scraper works as follows:
+
+1. A list of all known odour descriptor terms (e.g., "sweet", "floral", "woody", "citrus", …) is compiled from the Good Scents vocabulary. This list was loaded from `smell_descriptors.csv`.
+
+2. For each descriptor term, a **POST request** is sent to the Good Scents search endpoint (`/search.php?qOdor=<descriptor>`), which returns a paginated list of molecules matching that odour profile.
+
+3. The HTML response is parsed with `BeautifulSoup`. For each molecule found, the parser extracts:
+   - Molecule **name**
+   - **CAS number** (a unique chemical registry identifier)
+   - Full list of **odour descriptors** associated with the molecule
+
+4. Pagination is followed automatically: if a "Next" link is present, the scraper continues to subsequent pages until all results for that descriptor are collected.
+
+5. Results are **deduplicated** by CAS number across all descriptor searches, so a molecule appearing under multiple descriptor queries is only stored once, with its complete descriptor list.
+
+The scraper was tested first on the descriptor "sweet", which returned 1526 molecules on the first page alone, confirming the scale and structure of the data. The full run collected the complete up-to-date Good Scents molecule inventory.
+
+---
+
+### Step 3 — Building the Final Odour Descriptor Dataset (`Preprocessing_Datasets.ipynb`)
+
+Before assembling any dataset, all datasets in the `pyrfume` repository tagged with `organism: human` and `data: odorCharacteristic` were systematically evaluated. Not all of them were usable — several were discarded for reasons such as missing odour descriptors, non-unique labels (multiple people smelling the same compound with no consensus), concentration-dependent responses, or data that only captured inter-molecule similarity rather than per-molecule descriptors. The full evaluation is documented in `Datasets_to_analyse_-_STAGE.pdf`.
+
+The datasets that were identified as usable and incorporated into the final merge are:
+
+- **Arctander** (`arctander_1960`): a curated dataset of ~2,772 molecules with SMILES strings and odour descriptors using the Chastrette classification scheme. Already contains SMILES directly; required only minimal preprocessing (dropping rows with missing values).
+
+- **Good Scents** (`goodscents`, scraped in Step 2): the freshly scraped full inventory of the Good Scents Company website. Provides molecule names and CAS numbers with associated odour descriptors. A **SMILES enrichment step** was applied: for each molecule, the CAS number (or name as fallback) was queried against the **PubChem API** to retrieve the corresponding `IsomericSMILES`. The process was rate-limited, cached to disk (`smiles_cache.json`) for resumability, and molecules with no resolved SMILES were dropped.
+
+- **FlavorDB** (`flavordb`): a database of flavour molecules and their associated odour/flavour descriptors. Identified as usable with minimal preprocessing.
+
+- **FlavorNet** (`flavornet`): another flavour-focused reference dataset with odour descriptors per compound. Identified as directly usable.
+
+- **Leffingwell** (`leffingwell`): a complete dataset with SMILES and odour descriptors, available in its entirety without additional processing.
+
+- **Sharma 2021a** (`sharma_2021a`): contains SMILES and odour labels presumably acquired via human evaluation. Used as-is.
+
+- **Sharma 2021b** (`sharma_2021b`): a larger dataset requiring more preprocessing to extract (SMILES, odour descriptors) pairs into a uniform shape. Incorporated after cleaning.
+
+- **Sigma 2014** (`sigma_2014`): contains SMILES and odour descriptors; origin not fully documented but included given the availability of the key fields.
+
+The following datasets from the pyrfume repository were evaluated and **excluded**: `aromadb` (poor data quality), `bushdid_2014` (no odour descriptors), `dravnieks_1985` (only 161 samples, descriptors not unambiguously linked to individual molecules), `foodb` / `freesolve` (no smell data), `ifra_2019` (only 3 descriptors per molecule, deemed too sparse), `keller_2012` / `keller_2016` (concentration-dependent labels, no expert consensus), `nat_geo_1986` / `nhanes_2014` / `weiss_2012` (not relevant to the task), `ravia_2020` (no clear per-molecule odour descriptors), and `snitz_2013` / `snitz_2019` (similarity comparisons rather than individual odour labels).
+
+The final merged dataset (`final_odor_dataset.csv`) contains columns `smiles` and `odor_descriptors`, spanning thousands of molecules across all included sources.
+
+**Fuzzy matching for descriptor normalisation:** The library `fuzzywuzzy` (with the `python-Levenshtein` backend for speed) was installed to handle approximate string matching between descriptor vocabularies across sources, since the same odour concept may appear under slightly different spellings (e.g., "citrus" vs. "citric", "woody" vs. "wood").
+
+---
+
+### Step 4 — Validating Coverage for Our 6 Molecules
+
+After constructing the final dataset, the 6 molecules from the e-nose experiment were checked for presence using their SMILES strings. Results:
+
+| Molecule | SMILES | In Final Dataset? |
+|---|---|---|
+| Ocimene | `CC(C)/C=C/C=C(\C)/C=C` | ✗ Not found |
+| Δ3-Carene | `CC1=CCC2C(C1)C2(C)C` | ✓ Found |
+| Linalool | `CC(=CCCC(C)(C=C)O)C` | ✓ Found |
+| α-Pinene | `CC1=C[C@H]2C[C@@H](C1)C2(C)C` | ✗ Not found |
+| (S)-Limonene | `CC1=CC[C@H](CC1)C(=C)C` | ✓ Found |
+| (R)-Limonene | `CC1=CC[C@@H](CC1)C(=C)C` | ✓ Found |
+
+The same 4 molecules found manually in Step 1 are confirmed present by exact SMILES match. Ocimene and α-Pinene remain absent — the isomer ambiguity for Ocimene and possible name/SMILES mismatch for α-Pinene mean they do not appear under the exact SMILES retrieved from PubChem. These two will require manual resolution, potentially by cross-referencing against the CAS numbers ISIPCA will provide.
