@@ -271,20 +271,16 @@ Following the ISIPCA meeting, the next concrete step was established: gather odo
 
 ### Step 1 — Searching for Odour Descriptors for the 6 Existing Molecules
 
-The first task was simply to find published odour descriptors for the 6 molecules already in the e-nose dataset (Ocimene, Δ3-Carene, Linalool, α-Pinene, (S)-Limonene, (R)-Limonene). The primary source used was the **Good Scents Company** website (`thegoodscentscompany.com`), a widely used industry reference that catalogues odour and flavour descriptors for thousands of fragrance molecules.
+The first task was to find published odour descriptors for the 6 molecules already in the e-nose dataset (Ocimene, Δ3-Carene, Linalool, α-Pinene, (S)-Limonene, (R)-Limonene). Rather than scraping from scratch at this stage, a pre-assembled Kaggle dataset was used as a first quick-lookup source: [**Multi-labelled SMILES Odors Dataset**](https://www.kaggle.com/datasets/aryanamitbarsainyan/multi-labelled-smiles-odors-dataset), which is itself a combination of Good Scents and Leffingwell data. The dataset encodes odour descriptors as a multi-hot binary matrix — one column per descriptor category (floral, fruity, sweet, woody, green, spicy, animal_musk, earthy, citrus, chemical, gourmand, powdery_amber, etc.) — with each molecule represented as a row.
 
-**Results:**
+Searching for the 6 molecules against this dataset yielded only **2 matches**: Δ3-Carene and α-Pinene. Their descriptor profiles were:
 
-| Molecule | Found in Good Scents? |
-|---|---|
-| Δ3-Carene | ✓ |
-| Linalool | ✓ |
-| (S)-Limonene | ✓ |
-| (R)-Limonene | ✓ |
-| Ocimene | ✗ |
-| α-Pinene | ✗ |
+| Molecule | floral | fruity | sweet | woody | green | spicy | earthy | citrus | chemical |
+|---|---|---|---|---|---|---|---|---|---|
+| α-Pinene | 0 | 0 | 1 | 1 | 1 | 1 | 1 | 0 | 0 |
+| Δ3-Carene | 0 | 0 | 1 | 1 | 1 | 0 | 0 | 1 | 1 |
 
-4 out of 6 molecules had odour descriptors available. Ocimene and α-Pinene were not found, likely because Ocimene's multiple isomers make it hard to resolve unambiguously in the database, and α-Pinene may be listed under a different name variant.
+The remaining 4 molecules (Ocimene, Linalool, (S)-Limonene, (R)-Limonene) were not present, likely due to limited coverage and SMILES string mismatch issues. This initial result made clear that a more exhaustive search across multiple data sources would be necessary, motivating the scraping and dataset synthesis process described in Steps 2 and 3.
 
 ---
 
@@ -343,15 +339,15 @@ The final merged dataset (`final_odor_dataset.csv`) contains columns `smiles` an
 
 ### Step 4 — Validating Coverage for Our 6 Molecules
 
-After constructing the final dataset, the 6 molecules from the e-nose experiment were checked for presence using their SMILES strings. Results:
+After constructing the final dataset, the 6 molecules from the e-nose experiment were checked for presence using exact SMILES string matching. A key fix was required for α-Pinene: the molecule had been stored in the e-nose dataset under the abbreviated name "a-pinene", which PubChem could not resolve correctly, returning a non-stereospecific SMILES. By changing the query name to **"alpha-pinene"** when retrieving the SMILES from PubChem, the correct canonical SMILES (`CC1=CCC2CC1C2(C)C`) was obtained — and that form was found in the final dataset. Results:
 
-| Molecule | SMILES | In Final Dataset? |
+| Molecule | SMILES used | In Final Dataset? |
 |---|---|---|
 | Ocimene | `CC(C)/C=C/C=C(\C)/C=C` | ✗ Not found |
 | Δ3-Carene | `CC1=CCC2C(C1)C2(C)C` | ✓ Found |
 | Linalool | `CC(=CCCC(C)(C=C)O)C` | ✓ Found |
-| α-Pinene | `CC1=C[C@H]2C[C@@H](C1)C2(C)C` | ✗ Not found |
+| α-Pinene | `CC1=CCC2CC1C2(C)C` | ✓ Found (after name fix) |
 | (S)-Limonene | `CC1=CC[C@H](CC1)C(=C)C` | ✓ Found |
 | (R)-Limonene | `CC1=CC[C@@H](CC1)C(=C)C` | ✓ Found |
 
-The same 4 molecules found manually in Step 1 are confirmed present by exact SMILES match. Ocimene and α-Pinene remain absent — the isomer ambiguity for Ocimene and possible name/SMILES mismatch for α-Pinene mean they do not appear under the exact SMILES retrieved from PubChem. These two will require manual resolution, potentially by cross-referencing against the CAS numbers ISIPCA will provide.
+**5 out of 6** molecules from the e-nose dataset are now covered by the final odour descriptor dataset. Only Ocimene remains absent — its multiple structural isomers (α, β-cis, β-trans) make it inherently ambiguous: the SMILES string returned by PubChem for the generic name "ocimene" may not correspond to the specific isomer used in the ISIPCA experiment, and no matching entry could be confirmed. Resolving this will require the CAS number or explicit SMILES to be provided by ISIPCA.
