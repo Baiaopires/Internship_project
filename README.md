@@ -351,3 +351,235 @@ After constructing the final dataset, the 6 molecules from the e-nose experiment
 | (R)-Limonene | `CC1=CC[C@@H](CC1)C(=C)C` | ✓ Found |
 
 **5 out of 6** molecules from the e-nose dataset are now covered by the final odour descriptor dataset. Only Ocimene remains absent — its multiple structural isomers (α, β-cis, β-trans) make it inherently ambiguous: the SMILES string returned by PubChem for the generic name "ocimene" may not correspond to the specific isomer used in the ISIPCA experiment, and no matching entry could be confirmed. Resolving this will require the CAS number or explicit SMILES to be provided by ISIPCA.
+
+## 8. Odour Descriptor Prediction — GNN with Hierarchical Multi-Label Classification
+
+### Overview
+
+Following the dataset construction work described in Section 7, the primary modelling objective of the internship shifted toward **predicting odour descriptors from molecular structure** — i.e., given a molecule's SMILES string, predict which of 138 perceptual odour categories (floral, woody, fruity, etc.) it belongs to. This is a **multi-label classification problem**: a molecule can simultaneously belong to many descriptors, and those descriptors are not independent — they are organised into a natural hierarchy.
+
+The dataset used throughout this section is the [Multi-labelled SMILES Odors Dataset](https://www.kaggle.com/datasets/aryanamitbarsainyan/multi-labelled-smiles-odors-dataset), a combination of Good Scents and Leffingwell data containing **4,983 molecules** encoded as a binary label matrix of **138 odour descriptors** alongside their non-stereo SMILES strings.
+
+---
+
+### Foundational Papers
+
+Two papers directly inform the architecture and methodology used in this section.
+
+**Sanchez-Lengeling et al. (2019) — "Machine Learning for Scent"**
+This paper introduced the `SmellGCN` architecture — a graph convolutional network trained on SMILES representations to predict multi-label odour descriptors. The core design choices are a four-layer GCNConv encoder with skip-connected global add pooling, followed by a two-layer BatchNorm + Dropout MLP head. This architecture forms the backbone of the model used throughout this work. The paper also established the dataset (Good Scents + Leffingwell) and the multi-label BCE training paradigm that we extend here.
+
+**Wehrmann et al. (2018) — "Hierarchical Multi-Label Classification Networks" (HMCN)**
+This paper proposed a neural network architecture specifically designed for hierarchical multi-label classification, where labels are organised in a tree or DAG structure. The key insight is that rather than choosing between a global classifier (which captures full label space relationships) or local classifiers (one per hierarchical level, which captures fine-grained within-level structure), HMCN simultaneously optimises both. It introduces dual information flows — a global flow and a local flow — combined with a hierarchical violation penalty that discourages logically inconsistent predictions (e.g., predicting `rose` without predicting `floral`). This paper motivates the architectural extension from the flat `SmellGCN` baseline to the `SmellGCN_HMCNF` model described below.
+
+---
+
+### Data Preprocessing
+
+#### Graph Construction
+
+Each molecule is converted from a SMILES string into a PyTorch Geometric `Data` object using `from_smiles`. Hydrogen atoms are excluded (`with_hydrogen=False`). Node features (`data.x`) encode 9 per-atom properties: atomic number, chirality, degree, formal charge, implicit hydrogen count, radical electrons, hybridisation type, aromaticity, and ring membership. Edge features encode 5 bond properties: bond type, stereo configuration, aromaticity, conjugation, and ring membership. The target vector `data.y` is a binary tensor of shape `(138,)` encoding the molecule's active odour descriptor labels.
+
+#### Stratified Train/Validation/Test Split
+
+A naive random split is inappropriate for multi-label datasets because it can leave rare labels unrepresented in one of the splits, making evaluation unreliable. Instead, **second-order iterative stratification** is applied using `skmultilearn.model_selection.IterativeStratification` with `order=2`.
+
+Order 2 means the algorithm attempts to preserve not only the marginal frequency of each individual label across splits (order 1), but also the co-occurrence frequencies of all label pairs. This is the appropriate choice here because the hierarchy constraint relies on label co-occurrences — if `rose` and `floral` never co-occur in the validation set, the hierarchy penalty cannot be evaluated properly. Higher orders (3+) were considered and rejected: with 4,983 molecules and 138 labels, the number of possible label triplets (~430,000) vastly exceeds the number of samples, making order-3 stratification statistically infeasible and computationally prohibitive.
+
+The split is performed in two sequential steps to avoid leakage: first an 80/20 train/holdout split, then the holdout is further split 50/50 into validation and test. The final proportions are **80% train / 10% validation / 10% test**.
+
+#### Class Imbalance Handling
+
+The label matrix is severely imbalanced — most of the 138 descriptors are positive for only a small fraction of molecules. To address this during training, per-label positive weights are computed as:
+
+```
+pos_weight[j] = num_negatives[j] / (num_positives[j] + ε)
+```
+
+where ε = 1e-5 prevents division by zero for labels with zero positive examples. These weights are passed to `BCEWithLogitsLoss` to upweight the gradient contribution of rare positive examples.
+
+---
+
+### Hierarchy Construction
+
+#### Meta-Category Grouping
+
+The 138 fine-grained labels are organised into 12 macro-categories (`META_CATEGORIES`), defined manually based on fragrance domain knowledge. Each macro-category acts as a parent group for a set of semantically related fine labels. The 12 macro-categories are named with the `macro_` prefix to distinguish them unambiguously from the fine-grained labels — both levels of the hierarchy are treated as distinct objects:
+
+| Macro-Category | Example Fine Labels |
+|---|---|
+| `macro_floral` | floral, rose, jasmin, lily, muguet, violet, lavender, geranium |
+| `macro_fruity` | fruity, apple, apricot, banana, berry, cherry, peach, strawberry |
+| `macro_sweet` | sweet, vanilla, caramellic, honey, chocolate, coconut, creamy |
+| `macro_woody` | woody, cedar, sandalwood, pine, vetiver, terpenic, balsamic |
+| `macro_green` | green, grassy, herbal, leafy, hay, fresh, cucumber, vegetable |
+| `macro_spicy` | spicy, cinnamon, clove, warm, pungent, mint, camphoreous |
+| `macro_animal_musk` | animal, musk, leathery, fishy, sweaty, meaty, musty |
+| `macro_earthy` | earthy, mushroom, nutty, roasted, coffee, tobacco, smoky |
+| `macro_citrus` | citrus, bergamot, ozone, clean, soapy |
+| `macro_chemical` | solvent, ethereal, metallic, medicinal, phenolic, sulfurous |
+| `macro_gourmand` | almond, malty, rummy, brandy, winey, cooked, savory, garlic |
+| `macro_powdery_amber` | amber, powdery, anisic, coumarinic, orris, waxy, aldehydic |
+
+#### Validated Child-Parent Pairs
+
+Not all manually assigned child-parent pairs are consistent with the data. For example, `chamomile` was assigned to `macro_floral`, but in the dataset `chamomile` frequently appears without `floral` co-occurring — the hierarchy assumption is wrong for that pair. Including invalid pairs in the hierarchy penalty actively hurts the model by penalising correct predictions.
+
+To address this, a **data-driven validation step** filters the child-parent pairs using conditional probability:
+
+```
+P(parent = 1 | child = 1) ≥ 0.6
+```
+
+For each candidate pair, this probability is computed empirically from the full dataset. Only pairs where the child reliably implies the parent are retained. This filter is critical: experiments confirmed that running the hierarchy penalty with unvalidated pairs significantly degraded all metrics, while validated pairs preserved or improved them.
+
+The final `validated_pairs` list is a set of `(child_column_index, parent_group_index)` tuples used exclusively inside the loss function. Labels that lose their parent assignment through filtering are not removed from the dataset — they continue to contribute to the BCE loss as flat labels.
+
+---
+
+### Model Architecture — `SmellGCN_HMCNF`
+
+The model is an adaptation of `SmellGCN_Paper` (from Sanchez-Lengeling et al.) to the HMCN-F paradigm (from Wehrmann et al.). The GCN encoder is preserved entirely; the MLP head is restructured to produce three simultaneous outputs.
+
+#### GCN Encoder (unchanged from baseline)
+
+Four `GCNConv` layers with progressively increasing hidden dimensions:
+
+```
+GCNConv(node_features → 15) → SELU
+GCNConv(15 → 20)            → SELU
+GCNConv(20 → 27)            → SELU
+GCNConv(27 → 36)            → SELU
+```
+
+After each layer, `global_add_pool` produces a graph-level representation by summing all node features. The five pooled representations (including the raw node features before any convolution) are concatenated into a single graph embedding of dimension `node_features + 15 + 20 + 27 + 36`. This skip-connected pooling strategy gives the model access to structural information at multiple levels of abstraction simultaneously.
+
+#### Global Flow
+
+A two-layer MLP processes the graph embedding into a sequence of hidden representations:
+
+```
+Linear(mlp_input_dim → 96) → BatchNorm → ReLU → Dropout(0.47)   [h1, level-1 repr.]
+Linear(96 → 63)             → BatchNorm → ReLU → Dropout(0.47)   [h2, level-2 repr.]
+Linear(63 → 138)                                                   [logits_global]
+```
+
+`logits_global` is the model's global prediction over all 138 fine-grained labels.
+
+#### Local Flow — Level 1 (12 macro-categories)
+
+A transition branch off `h1` (the intermediate 96-dimensional representation) produces predictions for the 12 macro-categories:
+
+```
+Linear(96 → 48) → BatchNorm → ReLU   [local hidden]
+Linear(48 → 12)                       [logits_local1]
+```
+
+This head is trained with its own BCE loss term against the ground-truth 12-group labels (derived on the fly from `y_138` via OR-aggregation over validated child indices). It forces `h1` to explicitly encode coarse odour family information.
+
+#### Local Flow — Level 2 (138 fine-grained labels)
+
+A transition branch off `h2` (the deeper 63-dimensional representation) produces a second independent prediction over the 138 fine-grained labels:
+
+```
+Linear(63 → 63) → BatchNorm → ReLU   [local hidden]
+Linear(63 → 138)                      [logits_local2]
+```
+
+This head is trained with its own BCE loss term against `y_138`, reinforcing that `h2` encodes fine-grained odour descriptor information.
+
+#### Final Combined Prediction
+
+At inference time, `logits_local2` and `logits_global` are combined as a weighted average:
+
+```
+logits_final = β × logits_local2 + (1 − β) × logits_global
+```
+
+with `β = 0.5` (equal weight to local and global information, as in Wehrmann et al.). The combined logit is used for threshold optimisation and all final evaluation metrics.
+
+---
+
+### Loss Function — `hmcnf_loss`
+
+The total loss has four terms:
+
+```
+L_total = L_global + L_local1 + L_local2 + λ × L_hierarchy
+```
+
+**`L_global`** — `BCEWithLogitsLoss` with `pos_weight` applied to `logits_global` against `y_138`. This is the primary fine-label training signal.
+
+**`L_local1`** — unweighted `BCEWithLogitsLoss` applied to `logits_local1` against the derived 12-group ground truth `y_12`. This trains the level-1 local head.
+
+**`L_local2`** — `BCEWithLogitsLoss` with `pos_weight` applied to `logits_local2` against `y_138`. This trains the level-2 local head with the same class-imbalance correction as the global head.
+
+**`L_hierarchy`** — the hierarchical violation penalty from Wehrmann et al. (Eq. 16), applied exclusively over `validated_pairs`:
+
+```
+L_hierarchy = (1 / |P|) × Σ_{(child, parent) ∈ P} mean[ relu(p_child − p_parent)² ]
+```
+
+where `p_child` and `p_parent` are sigmoid probabilities from `logits_global`, and `p_parent` is derived as the elementwise max over all children of that group. The squared form penalises large violations more aggressively than the linear form. Normalisation by `|P|` (number of validated pairs) keeps the penalty magnitude stable regardless of how many pairs survive the validation filter.
+
+**λ (lambda)** controls the weight of the hierarchy penalty relative to the BCE terms. Setting λ too large forces the model to prioritise consistency over correct prediction, degrading precision. Setting λ too small makes the penalty ineffective.
+
+---
+
+### Training Configuration & Hyperparameters
+
+| Hyperparameter | Value | Rationale |
+|---|---|---|
+| Optimiser | Adam | Standard choice for GNNs; adaptive learning rates handle the sparse gradient signal from rare labels |
+| Learning rate | 0.001 | Default Adam LR; warm restarts reduce sensitivity to this choice |
+| Scheduler | `CosineAnnealingWarmRestarts` | Periodically resets the learning rate to escape local minima in a non-convex 138-label loss landscape |
+| T_0 | 50 | Restart period in epochs; each cycle allows the model to converge before the next reset |
+| T_mult | 1 | Equal-length cycles; appropriate for long runs where consistent exploration is preferred over progressive refinement |
+| Batch size | 32 | Standard for graph datasets of this scale; consistent with established practice |
+| Dropout | 0.47 | Inherited from the SmellGCN_Paper architecture; prevents overfitting on the ~4,000 training molecule set |
+| β | 0.5 | Equal weighting of local and global predictions; fixed as in Wehrmann et al. |
+| λ (lambda) | 0.3 | Determined empirically; validated pairs allow a higher lambda than would be safe with unvalidated pairs |
+| P threshold | 0.6 | Conditional probability threshold for validated pairs; balances hierarchy coverage against signal quality |
+| Epochs | 1000 | Model has not fully converged at 500 epochs; AUROC and Macro F1 continue improving past this point |
+
+---
+
+### Threshold Optimisation
+
+Since the model outputs continuous probabilities for each label, a binary prediction requires a threshold. Rather than using a fixed threshold of 0.5 (which performs poorly on imbalanced labels), **per-label threshold optimisation** is performed on the validation set after training.
+
+For each of the 138 fine labels and each of the 12 macro-categories separately, the threshold is swept from 0.01 to 0.99 in steps of 0.01. At each threshold, the per-label macro-F1 is computed. The threshold that maximises macro-F1 for each label is retained. The resulting `thresholds_138` and `thresholds_12` tensors are applied at test time to produce the final binary predictions.
+
+Threshold optimisation is always performed after training, never during it. The fixed-threshold metrics monitored during the training loop serve only as a training signal proxy and do not reflect final model performance.
+
+---
+
+### Evaluation Metrics
+
+Metrics are computed separately for the two prediction levels: the 138 fine-grained labels (HMCN Fine) and the 12 macro-category predictions from `logits_local1` (HMCN Meta). All metrics use the `macro` averaging strategy unless otherwise stated, which treats all labels equally regardless of their frequency — appropriate for this dataset where rare labels are of equal scientific interest to common ones.
+
+Labels for which only one class is present in the test set are excluded from AUC computations to avoid undefined metric errors; the number of included labels is reported explicitly.
+
+#### Metrics computed for both levels
+
+**ROC AUC (macro)** — area under the receiver operating characteristic curve, averaged across labels. Measures ranking quality: how well the model separates positive from negative examples regardless of threshold. Threshold-independent, making it a reliable primary metric even before threshold optimisation. Macro averaging ensures rare labels are not dominated by frequent ones.
+
+**PR AUC (macro)** — area under the precision-recall curve, averaged across labels. More informative than ROC AUC for severely imbalanced label distributions: a model that trivially predicts all negatives achieves high ROC AUC but near-zero PR AUC. For this dataset, where most labels are positive for fewer than 10% of molecules, PR AUC is a more honest measure of predictive quality.
+
+**Hierarchical Violation Rate** — the fraction of predicted child-label activations that are inconsistent with their parent: `child=1` in `y_pred_138` while the corresponding `parent=0` in `y_pred_12`. Computed jointly across both prediction levels. Directly quantifies whether the HMCN architecture achieves its primary design goal of hierarchical consistency. A lower rate indicates more structurally coherent predictions.
+
+#### Metrics computed for HMCN Fine (138 labels) only
+
+**F1 (macro, top-20)** — macro-averaged F1 score computed over the 20 labels with the highest representation in the test set. Reported on a subset because the majority of the 138 labels are too rare in the test split to produce reliable per-label estimates; including highly sparse labels in macro averaging inflates variance without adding information. The top-20 subset provides a stable and interpretable view of fine-grained prediction quality.
+
+#### Metrics computed for HMCN Meta (12 labels) only
+
+**F1 (macro)** — macro-averaged F1 over all 12 macro-categories. The 12-group prediction task is far more tractable than the 138-label task: all groups are reasonably represented in the test set, so full macro-F1 is meaningful and stable here.
+
+**Balanced Accuracy (macro)** — the average of sensitivity and specificity per label, then averaged across labels. Unlike standard accuracy, balanced accuracy gives equal weight to correct positive and correct negative predictions. This matters for the 12-group evaluation because some macro-categories (e.g., `macro_chemical`) are less frequent than others (e.g., `macro_fruity`), and standard accuracy would be dominated by the majority groups.
+
+**Sensitivity (macro)** — true positive rate per label, averaged across the 12 groups. Measures how well the model identifies molecules that belong to each odour family. Low sensitivity on a group means the model systematically misses molecules of that family.
+
+**Specificity (macro)** — true negative rate per label, averaged across the 12 groups. Measures how well the model rejects molecules that do not belong to each family. Together with sensitivity, it provides a complete view of per-group discrimination ability and directly informs the balanced accuracy score.
+
+**Label Co-occurrence Consistency** — measures how well the model's predicted label co-occurrence structure matches the ground-truth co-occurrence structure at the 12-group level. The ground-truth co-occurrence matrix `C_true` and the predicted co-occurrence matrix `C_pred` are both normalised to [0, 1], and consistency is computed as `1 − mean(|C_true − C_pred|)`. A value near 1 means the model predicts label combinations that reflect real-world odour family co-occurrence patterns; a value near 0 means predictions are structurally incoherent. This metric is reported only at the 12-group level because at 138 labels the co-occurrence space is too large and sparse to be meaningful given the dataset size.
