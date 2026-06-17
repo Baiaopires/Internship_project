@@ -667,7 +667,7 @@ function was written using RDKit to produce a richer feature set:
 | 4 | Is in ring | Boolean |
 | 5 | Is stereo (E/Z) | Boolean |
 | 6 | Is conjugated | Boolean |
-| 7 | Bond polarity | `|Δ electronegativity|` from Pauling scale lookup |
+| 7 | Bond polarity | Δ electronegativity| from Pauling scale lookup |
 
 A key implementation note: the default `from_smiles` in current PyTorch Geometric returns
 edge attributes as a `LongTensor`, which must be explicitly cast to `.float()` before
@@ -937,7 +937,7 @@ stratification (80/10/10 split), per-label threshold optimisation on the validat
 | Hierarchy penalty weight (λ) | 0, 0.01, 0.1, 0.3, 0.5 |
 | Training epochs | 100, 500, 1000 |
 
-Model checkpointing saved the best epoch by validation loss. The sweep totalled over 30
+Model checkpointing saved the best epoch by AUROC. The sweep totalled over 30
 distinct training runs. Key findings:
 
 - **More attention heads generally help up to N=8.** The N=8 configurations produce the
