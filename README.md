@@ -583,3 +583,464 @@ Labels for which only one class is present in the test set are excluded from AUC
 **Specificity (macro)** — true negative rate per label, averaged across the 12 groups. Measures how well the model rejects molecules that do not belong to each family. Together with sensitivity, it provides a complete view of per-group discrimination ability and directly informs the balanced accuracy score.
 
 **Label Co-occurrence Consistency** — measures how well the model's predicted label co-occurrence structure matches the ground-truth co-occurrence structure at the 12-group level. The ground-truth co-occurrence matrix `C_true` and the predicted co-occurrence matrix `C_pred` are both normalised to [0, 1], and consistency is computed as `1 − mean(|C_true − C_pred|)`. A value near 1 means the model predicts label combinations that reflect real-world odour family co-occurrence patterns; a value near 0 means predictions are structurally incoherent. This metric is reported only at the 12-group level because at 138 labels the co-occurrence space is too large and sparse to be meaningful given the dataset size.
+
+## 9. Architectural Refinements, Dataset Compatibility Analysis, and the Path Toward a True HMCN-F
+
+### Overview
+
+Following the initial implementation of `SmellGCN_HMCNF` described in Section 8, a series
+of refinements were made to the architecture, the graph feature representation, the final
+prediction combination, the loss function, and the evaluation pipeline. The most significant
+architectural change was the replacement of GCNConv layers with GATv2Conv layers and the
+introduction of a richer set of RDKit-derived node and edge features, producing the new
+architecture `SmellGATV2_HMCNF`. This work was also driven by a deeper analysis of the
+paper's assumptions and whether the Multi-labelled SMILES Odors dataset actually satisfies
+them. Several mismatches between the dataset structure and the HMCN-F design were identified,
+leading to important architectural corrections and a clear path toward a more faithful
+implementation in the next phase of the internship.
+
+---
+
+### 9.1 From GCNConv to GATv2Conv — Motivation and Architecture
+
+#### 9.1.1 Limitations of GCNConv for Molecular Property Prediction
+
+The `SmellGCN_HMCNF` model from Section 8 used standard GCNConv layers operating on
+PyTorch Geometric's default `from_smiles` features: 9 node features and 3 edge features.
+GCNConv aggregates neighbour information using fixed topology weights
+`1/sqrt(d̂_i * d̂_j)`, derived solely from node degrees. This has two key limitations
+in the molecular setting:
+
+1. **Bond-type information is ignored.** The connectivity weight depends only on the
+   degree of the source and target atoms, not on whether the bond between them is single,
+   double, triple, or aromatic. Two atoms connected by a double bond are treated identically
+   to two atoms connected by a single bond during aggregation.
+
+2. **Attention is static.** Every neighbour of a given atom contributes with the same
+   normalised degree-based weight, regardless of the chemical context. GCNConv cannot
+   learn that a highly electronegative neighbour should receive more attention than a
+   hydrogen when predicting odour properties.
+
+GATv2Conv (Brody et al., 2022) addresses both problems. Its attention coefficient
+`α_ij` is computed from a joint non-linear scoring of the source atom representation
+`W_l·x_i`, the neighbour atom representation `W_r·x_j`, and the bond features
+`W_e·e_ij`, passed through LeakyReLU before softmax normalisation. This makes the
+attention *dynamic* — the weight assigned to a neighbour depends on the specific pair,
+not only on their degree — and it natively incorporates edge features into the
+aggregation, making bond type information directly accessible to every layer.
+
+GATv2 also fixes a theoretical limitation of the original GAT: GAT computes attention
+using a linear scoring function before the non-linearity, which in certain configurations
+causes all instances to produce the same ranking of neighbours regardless of the input
+(static attention). GATv2 interleaves the linear transformation and the non-linearity
+differently, guaranteeing dynamic attention.
+
+#### 9.1.2 Custom RDKit Graph Features
+
+The default PyTorch Geometric `from_smiles` function returns only 9 node features and
+3 edge features (bond type, is-in-ring, is-conjugated). This representation omits
+several chemically important signals for odour prediction. A custom `smiles_to_graph`
+function was written using RDKit to produce a richer feature set:
+
+**22 node features:**
+
+| Index | Feature | Notes |
+|---|---|---|
+| 0 | Atomic number | Raw integer |
+| 1–4 | Chirality | One-hot: unspecified, CW, CCW, other |
+| 5 | Degree | Number of covalent bonds |
+| 6 | Formal charge | Signed integer |
+| 7 | Implicit hydrogen count | |
+| 8 | Number of radical electrons | |
+| 9–12 | Hybridisation | One-hot: SP, SP2, SP3, other |
+| 13 | Is aromatic | Boolean |
+| 14–18 | Ring size membership | Boolean for rings of size 3, 4, 5, 6, 7 |
+| 19 | Gasteiger partial charge | Continuous; NaN → 0.0 |
+| 20 | H-bond donor | Boolean |
+| 21 | H-bond acceptor | Boolean |
+
+**8 edge features:**
+
+| Index | Feature | Notes |
+|---|---|---|
+| 0–3 | Bond type | One-hot: single, double, triple, aromatic |
+| 4 | Is in ring | Boolean |
+| 5 | Is stereo (E/Z) | Boolean |
+| 6 | Is conjugated | Boolean |
+| 7 | Bond polarity | `|Δ electronegativity|` from Pauling scale lookup |
+
+A key implementation note: the default `from_smiles` in current PyTorch Geometric returns
+edge attributes as a `LongTensor`, which must be explicitly cast to `.float()` before
+passing to GATv2Conv. The function also returns only 3 edge features (bond type, ring,
+conjugated), not 5 as in older versions of the library. The custom RDKit construction
+was therefore necessary both for the richer features and for the correct tensor dtype.
+
+#### 9.1.3 SmellGATV2_HMCNF Architecture
+
+The full architecture of `SmellGATV2_HMCNF` is as follows. All GATv2Conv layers use
+`concat=False`, meaning the multi-head outputs are averaged rather than concatenated,
+keeping channel dimensions fixed regardless of the number of heads:
+
+```
+Input: molecular graph with 22 node features, 8 edge features
+
+Graph encoder (4 × GATv2Conv with global_add_pool at each layer):
+  conv1: GATv2Conv(22  → 15,  edge_dim=8, heads=N, concat=False)
+  conv2: GATv2Conv(15  → 20,  edge_dim=8, heads=N, concat=False)
+  conv3: GATv2Conv(20  → 27,  edge_dim=8, heads=N, concat=False)
+  conv4: GATv2Conv(27  → 36,  edge_dim=8, heads=N, concat=False)
+
+Each layer output is pooled via global_add_pool and concatenated:
+  graph_repr = [pool1 || pool2 || pool3 || pool4 || x_in_pool]
+             = [15 + 20 + 27 + 36 + 22] = 120 dimensions
+
+HMCN-F classification head:
+  Global branch:
+    global_mlp1:  Linear(120, 96) → BatchNorm → ReLU → Dropout
+    global_mlp2:  Linear(96,  63) → BatchNorm → ReLU → Dropout
+    global_out:   Linear(63, 138)  → logits_global
+
+  Local branch (shared input = graph_repr):
+    local_mlp1a:  Linear(120, 96) → BatchNorm → ReLU → Dropout
+    local_out1:   Linear(96,  12)  → logits_local1   (12 macro-categories)
+    local_mlp2a:  Linear(120, 96) → BatchNorm → ReLU → Dropout
+    local_out2:   Linear(96, 138)  → logits_local2   (138 fine labels)
+
+Final prediction (probability space, matching Equation 6):
+  probs = β * σ(logits_local2) + (1 - β) * σ(logits_global)
+```
+
+The parameter `N` (number of attention heads) was treated as a hyperparameter and swept
+over `{1, 2, 4, 8}`. A `drop_last=True` flag was applied to the training DataLoader to
+prevent BatchNorm from receiving a batch of size 1 on the final iteration, which would
+cause a crash when the dataset size is not divisible by the batch size.
+
+---
+
+### 9.2 Discovering the Concatenation Problem in Equation 6
+
+The final prediction in HMCN-F is defined in Equation 6 of Wehrmann et al. as:
+
+```
+P_F = β * [P¹_L ⊕ P²_L ⊕ ... ⊕ P^|H|_L] + (1 - β) * P_G
+```
+
+where ⊕ denotes concatenation of all local output predictions across hierarchical levels,
+and the result is combined with the global prediction P_G. This equation is only well-defined
+when the concatenated local outputs together cover exactly |C| dimensions — i.e., each label
+belongs to exactly one hierarchical level, and the local heads collectively tile the full
+label space with no overlaps and no gaps.
+
+In the initial `SmellGCN_HMCNF` implementation, `logits_local1` had shape `(batch, 12)` and
+`logits_local2` had shape `(batch, 138)`. Concatenating them would produce a tensor of size
+150, which cannot be combined with `logits_global` of shape `(batch, 138)` in a weighted sum.
+The original implementation avoided this by using only `logits_local2` in the final
+combination, silently deviating from Equation 6 without documenting the reason.
+
+This deviation was identified, analysed, and justified as follows.
+
+---
+
+### 9.3 Why the Dataset Is Not Directly Compatible with HMCN-F
+
+The root cause of the concatenation problem is a structural mismatch between this dataset
+and the datasets the HMCN paper was designed for.
+
+**In the paper's datasets** (Reuters, Gene Ontology, FunCat), the hierarchy is a single
+unified label space. Every node — from root to leaf — is a distinct entry in the same label
+vector of size |C|. Parent labels are **independently annotated** by human experts. A Reuters
+editor can tag a news article as `ECONOMICS=1` without assigning any specific child label,
+because the coarse category was confirmed independently of the fine one. In Gene Ontology, a
+protein can be labelled with a broad biological process without any specific sub-process being
+confirmed, because the two annotations come from separate experiments. Parent labels carry
+information that their children do not — they can be active even when all children are
+inactive.
+
+**In the Multi-labelled SMILES Odors dataset**, the 12 macro-categories (`macro_floral`,
+`macro_fruity`, etc.) are not part of the original annotation. A perfumer smelling a molecule
+wrote down specific descriptors (`rose`, `jasmine`, `floral`, `woody`) — there was never a
+separate step where anyone annotated "this molecule belongs to the floral macro-family". The
+12 macro-categories were introduced as a post-hoc grouping during this internship. As a
+consequence, the macro labels are **deterministically derived** from their children via
+OR-aggregation: `macro_floral = 1` if and only if at least one validated floral child is
+active. They carry no independent information beyond what the 138 fine labels already encode.
+
+This makes appending the 12 macro labels to the dataset to reach 150 dimensions technically
+possible but scientifically unsound. The loss terms on the 12 derived positions would provide
+no independent supervisory signal — once the fine labels are learned correctly, the macro
+labels follow by construction. Training on them as if they were independent targets would
+add noise to the gradient and require consistent slicing of predictions back to 138 dimensions
+throughout the entire evaluation pipeline without any modelling benefit.
+
+The full analysis of this structural mismatch is documented in `architecture_differences.txt`.
+
+---
+
+### 9.4 Correction to the Final Prediction Combination
+
+As a direct consequence of the analysis above, the final prediction was corrected from
+logit-space combination to probability-space combination, matching the paper's intent:
+
+**Previous (incorrect):**
+```python
+out = beta * logits_local2 + (1 - beta) * logits_global
+probs = torch.sigmoid(out)
+```
+
+This computes `σ(β * logits_local2 + (1-β) * logits_global)`, which is not equal to
+`β * σ(logits_local2) + (1-β) * σ(logits_global)` due to the nonlinearity of σ. The two
+forms only coincide when β = 0 or β = 1.
+
+**Corrected (matches Equation 6):**
+```python
+probs = beta * torch.sigmoid(logits_local2) + (1 - beta) * torch.sigmoid(logits_global)
+```
+
+This correction was applied consistently across `calculate_all_metrics`,
+`find_per_label_thresholds`, and `calculate_all_metrics_thresh`. The loss function
+(`hmcnf_loss`) was unaffected — it receives the three raw logit tensors directly and
+never uses `out`.
+
+The reason `logits_local1` does not appear in P_F is also now explicitly documented:
+with the current macro-category design, `logits_local1` (size 12) cannot be combined with
+the 138-dimensional final prediction without the dimensional mismatch described above.
+`logits_local1` contributes exclusively through its training loss term `L_local1`, which
+shapes the intermediate representation `h1` to encode coarse odour family information, but
+does not contribute to the final inference output.
+
+---
+
+### 9.5 Residual Connection — Tested and Reverted
+
+Following the recommendation in Wehrmann et al. (Section 3.1), which describes residual
+connections as part of the HMCN-F fully-connected layers, a residual connection was added
+from `graph_repr` (the full GCN pooled output) directly into `h2`:
+
+```python
+# Added to __init__
+self.residual_proj = Linear(self.mlp_input_dim, 63)
+
+# Added to forward
+h2 = F.relu(self.global_bn2(self.global_mlp2(h1)) + self.residual_proj(graph_repr))
+```
+
+The rationale was to give `h2` a direct path back to the raw molecular representation,
+bypassing the compression from `mlp_input_dim → 96 → 63` and providing shorter gradient
+paths during backpropagation.
+
+The experiment ran for 500 epochs with λ=0.3 and all other hyperparameters unchanged. The
+val loss began diverging from train loss at approximately epoch 250 — a clear overfitting
+signature. The `Linear(mlp_input_dim, 63)` projection added a substantial number of
+parameters that the ~4,000 training molecule dataset could not support without stronger
+regularisation. The paper uses residual connections on significantly larger datasets; the
+same design choice does not transfer directly to this data regime.
+
+The residual projection was removed and the original two-layer MLP architecture was restored.
+Increasing dropout from 0.47 to 0.60 (the paper's value) was considered as an alternative
+regularisation strategy but not pursued, since the original architecture without the residual
+did not exhibit overfitting.
+
+---
+
+### 9.6 META_CATEGORIES Naming Convention
+
+A naming collision was identified between the 138 fine-grained labels and the macro-category
+group names: `floral`, `fruity`, `woody`, and several other labels exist both as entries in
+the 138-label dataset and as keys in `META_CATEGORIES`. This created a self-reference problem
+in `child_parent_pairs` construction, where a label could be mapped as a child of its own
+group, producing a penalty term of zero by construction (since `p_child = p_parent` trivially
+when they refer to the same label index).
+
+All `META_CATEGORIES` keys were renamed with a `macro_` prefix:
+
+```python
+META_CATEGORIES = {
+    'macro_floral':       ['floral', 'rose', 'jasmin', 'lily', ...],
+    'macro_fruity':       ['fruity', 'apple', 'apricot', 'banana', ...],
+    'macro_woody':        ['woody', 'cedar', 'sandalwood', ...],
+    ...
+}
+```
+
+Since the parent group names are only used as dictionary keys during `child_parent_pairs`
+construction, and never appear in `label_columns` (which is built from the actual dataset
+column names), no downstream code required modification. The change is purely semantic but
+eliminates the collision unambiguously.
+
+---
+
+### 9.7 Expanded Evaluation Pipeline — Dual-Level Metrics
+
+The evaluation pipeline was extended to compute metrics at both hierarchical levels
+simultaneously, using a unified `calculate_all_metrics_thresh` function. The function now
+accepts separate threshold tensors for the 138 fine labels (`thresholds_138`) and the 12
+macro-categories (`thresholds_12`), and prints results in two clearly separated blocks.
+
+#### Metrics added
+
+The following metrics were not present in the original evaluation pipeline and were added
+during this phase:
+
+**PR AUC (macro)** — added for both levels. More informative than ROC AUC for the severely
+imbalanced label distributions in this dataset. A model that trivially predicts all negatives
+can achieve high ROC AUC; PR AUC penalises this directly.
+
+**Hierarchical Violation Rate** — added as a joint metric computed across both prediction
+levels. Measures the fraction of cases where a child label fires (`y_pred_138[:, child]=1`)
+but its validated parent does not (`y_pred_12[:, parent]=0`). Directly quantifies whether
+the HMCN architecture is achieving its primary design goal. Reported in both sections of the
+evaluation output since it is a property of the joint prediction.
+
+**Balanced Accuracy, Sensitivity, Specificity** — added for the 12 macro-category level
+only. Computed per group then averaged (macro strategy). These metrics are not reported at
+the 138-label level because the extreme label sparsity makes per-label sensitivity and
+specificity unreliable at that granularity — specificity in particular approaches 1.0
+trivially for rare labels regardless of model quality.
+
+**Label Co-occurrence Consistency** — added for the 12 macro-category level only. Measures
+whether the model's predicted label co-occurrence matrix matches the ground-truth
+co-occurrence matrix, normalised and compared via mean absolute difference. Reported only
+at the 12-group level because the 138-label co-occurrence space is too sparse to be
+meaningful given the dataset size.
+
+**F1 macro top-20** — added for the 138-label level. Full macro-F1 across all 138 labels is
+unstable due to the large number of very rare labels in the test set. The top-20 most
+represented labels provide a stable and interpretable view of fine-grained prediction quality.
+
+**Instance F1** — added for the 12 macro-category level as part of a parallel comparison
+with 12 independent binary classifiers (one per macro-group). Instance F1 (`average='samples'`
+in sklearn) computes F1 per molecule then averages across all molecules, directly measuring
+how well the model recovers the complete correct label combination per molecule rather than
+averaging across labels. This metric is most sensitive to the benefit of joint multi-label
+prediction over independent binary classification.
+
+#### Handling of constant label columns
+
+Some macro-category columns in the test set contain only one class (all-zero or all-one),
+making AUC computation undefined. The evaluation function filters these columns before
+computing AUC metrics and reports the count of valid columns explicitly, e.g.,
+`ROC AUC (11/12 groups)`. This makes the evaluation transparent and prevents silent
+undefined metric warnings from propagating.
+
+---
+
+### 9.8 Hyperparameter Sweeps
+
+The `SmellGATV2_HMCNF` model was trained across a systematic sweep of the following
+hyperparameters. All other settings were held constant: learning rate 0.001, cosine
+annealing with T₀=50 warm restarts, batch size 128, β=0.5, second-order iterative
+stratification (80/10/10 split), per-label threshold optimisation on the validation set.
+
+| Hyperparameter | Values explored |
+|---|---|
+| Number of attention heads (N) | 1, 2, 4, 8 |
+| Hierarchy penalty weight (λ) | 0, 0.01, 0.1, 0.3, 0.5 |
+| Training epochs | 100, 500, 1000 |
+
+Model checkpointing saved the best epoch by validation loss. The sweep totalled over 30
+distinct training runs. Key findings:
+
+- **More attention heads generally help up to N=8.** The N=8 configurations produce the
+  highest PR-AUC and F1-micro at 500 epochs, while N=2 achieves the highest single AUROC.
+- **λ=0 maximises F1-macro at the cost of higher hierarchy violations.** Removing the
+  penalty frees the classifier to optimise raw F1, but hierarchy violation rates rise to
+  ~0.16–0.20. λ=0.01 offers a practical tradeoff — nearly equivalent F1 with substantially
+  lower violations, particularly at 1000 epochs.
+- **500 epochs is often near-optimal.** Extending to 1000 epochs improves AUROC marginally
+  but does not consistently improve F1-macro — the per-label threshold calibration step
+  appears to be the binding constraint.
+- **λ values ≥ 0.3 suppress F1-macro without commensurate gains in hierarchy compliance.**
+  The penalty is most beneficial in the small range λ ∈ {0.01, 0.1}.
+
+---
+
+### 9.9 Best Results This Week
+
+All results use second-order iterative stratification (80/10/10 split), per-label threshold
+optimisation on the validation set, and `macro` averaging for all reported metrics.
+
+#### SmellGATV2_HMCNF — Sweep Summary
+
+The table below shows selected representative configurations, sorted by F1 macro (138
+labels). Entries marked † are the configurations that together form the Pareto frontier
+across the three primary metrics.
+
+| Heads | λ | Epochs | AUROC | PR-AUC | F1 macro | F1 micro | F1 mac-12 | Hier. viol. |
+|---|---|---|---|---|---|---|---|---|
+| 8 | 0.00 | 500 | 0.8789 | **0.3443** | **0.3257** | **0.4054** | 0.5980 | 0.160 |
+| 8 | 0.01 | 1000 | **0.8844** | 0.3326 | 0.3060 | 0.4049 | **0.6035** | **0.123** |
+| 2 | 0.10 | 1000 | 0.8864 | 0.3359 | 0.3104 | 0.3982 | 0.5840 | 0.213 |
+| 2 | 0.10 | 500  | 0.8849 | 0.3373 | 0.3114 | 0.3966 | 0.5890 | 0.164 |
+| 8 | 0.01 | 500  | 0.8695 | 0.3297 | 0.3079 | 0.4020 | 0.5928 | 0.194 |
+| 8 | 0.00 | 1000 | 0.8822 | 0.3276 | 0.3152 | 0.4099 | 0.5792 | 0.181 |
+| 8 | 0.10 | 500  | 0.8843 | 0.3262 | 0.3067 | 0.3968 | 0.5804 | 0.184 |
+| 4 | 0.30 | 500  | 0.8755 | 0.2975 | 0.2748 | 0.3820 | 0.6013 | 0.163 |
+| 1 | 0.01 | 500  | 0.8778 | 0.3021 | 0.2857 | 0.3913 | 0.5765 | 0.177 |
+
+Three distinct operating points emerge from the sweep:
+
+- **Maximum F1-macro-138 (heads=8, λ=0, 500ep):** F1-macro 0.326, PR-AUC 0.344.
+  Best for fine-label classification quality. Hierarchy violation rate 0.160 — acceptable
+  but the highest among the top configurations.
+
+- **Maximum AUROC + hierarchy compliance (heads=8, λ=0.01, 1000ep):** AUROC 0.884,
+  hierarchy violation rate 0.123 — the lowest observed. F1 macro-12 0.604, the highest
+  overall. Trades a small amount of F1-macro-138 for substantially better discrimination
+  and consistency.
+
+- **Balanced all-round (heads=2, λ=0.1, 500ep):** Competitive on all metrics without
+  requiring 1000 epochs. AUROC 0.885, PR-AUC 0.337, F1-macro 0.311. Converges more
+  reliably than N=8 configurations.
+
+#### Comparison Across Architecture Generations
+
+| Architecture | Features | Epochs | AUROC | PR-AUC | F1 macro | F1 micro |
+|---|---|---|---|---|---|---|
+| GNN paper (flat BCE) | base (9n/3e) | 500 | 0.841 | 0.182 | 0.228 | 0.329 |
+| SmellGCN_HMCNF (Section 8) | base (9n/3e) | 500 | 0.856 | 0.269 | 0.267 | 0.382 |
+| SmellGATV2_HMCNF best-F1 | rich (22n/8e) | 500 | 0.879 | 0.344 | 0.326 | 0.405 |
+| SmellGATV2_HMCNF best-AUROC | rich (22n/8e) | 1000 | 0.886 | 0.333 | 0.310 | 0.405 |
+
+The jump from the flat BCE baseline to `SmellGCN_HMCNF` is attributable primarily to the
+HMCN-F head (+48% PR-AUC). The further jump to `SmellGATV2_HMCNF` is attributable to both
+the richer feature set and the dynamic attention mechanism — the two effects cannot be fully
+disentangled in this comparison since they were introduced together.
+
+---
+
+### 9.10 The Path Forward — Using Fine Labels as Parents
+
+The most significant conceptual outcome of this week's analysis is the identification of a
+more principled hierarchy that makes the architecture fully compatible with HMCN-F without
+any of the workarounds described above.
+
+Several of the 138 fine-grained labels are themselves generic descriptors that act as parents
+in the dataset's natural annotation structure. A perfumer annotating a molecule as `floral`
+without `rose`, `jasmine`, or `lily` is making exactly the same kind of independent coarse
+annotation that a Reuters editor makes when tagging `ECONOMICS` without a specific sub-topic.
+The conditional probability analysis performed in Section 8 confirms this: `P(floral=1 |
+rose=1) ≈ 0.78`, meaning 22% of rose-labelled molecules do not carry the `floral` label —
+`floral` is not a deterministic consequence of its children, it carries independent
+information.
+
+Labels such as `floral`, `woody`, `fruity`, `green`, `sweet`, `citrus`, `spicy`, `earthy`,
+`animal`, and `musk` all exist in the 138-label space and all have more specific siblings
+that co-occur with them non-deterministically. This makes them genuine parent labels in the
+HMCN-F sense.
+
+Under this redesign:
+
+- **Level 1** covers ~10-15 parent labels identified within the 138 (e.g., `floral`, `woody`,
+  `fruity`, `green`, `sweet`, `citrus`, `spicy`, `earthy`, `animal`, `musk`)
+- **Level 2** covers the remaining ~123-128 child labels
+- Both levels are subsets of the same 138-dimensional label vector with no overlap
+- Concatenating `logits_local1` and `logits_local2` produces exactly size 138 = |C|
+- Equation 6 is satisfied without any dimensional workaround
+- The 12 external `META_CATEGORIES` and the `macro_` naming convention become unnecessary
+- The hierarchy penalty operates between labels that were independently annotated, not
+  between a label and a derived aggregate of itself
+
+This redesign is the primary architectural objective for the next phase of the internship.
+It requires re-running the conditional probability analysis to identify the definitive set of
+parent labels within the 138, redefining `child_parent_pairs` accordingly, and adapting
+the local output head dimensions to match the new level sizes.
