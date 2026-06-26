@@ -1045,169 +1045,135 @@ It requires re-running the conditional probability analysis to identify the defi
 parent labels within the 138, redefining `child_parent_pairs` accordingly, and adapting
 the local output head dimensions to match the new level sizes.
 
-### 9.11 Detailed Configuration Sweep — Cross-Cut Analysis
+## 10. Comprehensive Multi-Configuration Sweep
 
-This section presents the full breakdown of the systematic hyperparameter sweep performed
-on the `SmellGATV2_HMCNF` model. While Section 9.8 introduced the sweep design and Section
-9.9 reported the headline results, this section dissects the sweep across each dimension
-in isolation, examines interaction effects between hyperparameters, and documents the
-practical reasoning that drove the choice of operating point for the final paper.
+Sections 9.8–9.9 established the hyperparameter sweep methodology on a single
+architecture (`SmellGATV2_HMCNF` with rich 22n/8e features and the original HMCN-F
+head dimensions). This section extends that work into a **systematic comparison across
+architectural variants** — varying the convolution operator, the input feature set, the
+presence of edge features, and the hidden-layer dimensions — to isolate which design
+decisions actually drive performance and which are second-order.
 
-#### Sweep Design
+Every configuration below was swept over the same core grid (attention heads, hierarchy
+penalty λ, and training epochs) and evaluated with the identical dual-level protocol from
+Section 9.7: second-order iterative stratification (80/10/10 split), per-label threshold
+optimisation on the validation set, and `macro` averaging. This keeps the comparison fair —
+the only thing that changes between configurations is the architectural axis under study.
 
-The sweep was structured as a partial grid over three primary hyperparameters, with all
-other components of the training pipeline held strictly constant to ensure that any
-observed differences in metrics could be attributed unambiguously to the swept dimensions.
-The fixed components are:
+### 10.1 Configurations Tested
 
-- Architecture: `SmellGATV2_HMCNF` with 4 GATv2Conv layers, hidden dimension 30, global
-  add pooling at every layer (resulting in a 120-dim graph representation).
-- Node and edge features: the rich 22-node / 8-edge feature set described in Section 9.1.
-- Optimiser: Adam with learning rate 1e-3, weight decay 0, β=(0.9, 0.999).
-- Scheduler: `CosineAnnealingWarmRestarts` with T₀=50, T_mult=1.
-- Loss: HMCN-F joint loss with β=0.5 mixing weight and BCE-with-logits per level, with
-  `pos_weight` derived from the training-set label frequencies.
-- Data split: second-order iterative stratification (80/10/10), reused as a fixed split
-  across all runs to eliminate split-variance as a confound.
-- Threshold calibration: per-label F1-maximising threshold sweep on the validation set,
-  applied post-hoc after the best checkpoint (selected on validation AUROC) is loaded.
-- Random seed: fixed across runs.
+Seven distinct configurations were swept, grouped along three architectural axes:
 
-The varied dimensions and their ranges are:
+**Axis 1 — Feature set and edge information (GATv2 backbone, original head dimensions):**
 
-| Dimension | Values | Cardinality |
-|---|---|---|
-| Number of attention heads (N) | 1, 2, 4, 8 | 4 |
-| Hierarchy penalty weight (λ) | 0.00, 0.01, 0.10, 0.30, 0.50 | 5 |
-| Training epochs | 100, 500, 1000 | 3 |
+| Configuration | Node feats | Edge feats | Runs | Purpose |
+|---|---|---|---|---|
+| `GATv2` rich | 22 | 8 | 20 | Reference configuration (Section 9) |
+| `GATv2` base features | 9 | 3 | 24 | Isolate the contribution of the rich RDKit feature set |
+| `GATv2` no edge features | 22 | none | 24 | Isolate the contribution of edge features to attention |
 
-The full Cartesian product would yield 60 configurations. A pragmatic subset of 30+ runs
-was executed, prioritising the cells most likely to be informative: all four head counts
-were paired with λ ∈ {0, 0.01, 0.1} at both 500 and 1000 epochs; λ ∈ {0.3, 0.5} were only
-explored at the 500-epoch budget after preliminary results indicated they consistently
-underperformed; the 100-epoch budget was used as a sanity floor for a handful of runs and
-confirmed that convergence had not been reached at that horizon.
+**Axis 2 — Convolution operator and feature set (original head dimensions):**
 
-#### Effect of the Number of Attention Heads (N)
+| Configuration | Operator | Node feats | Runs | Purpose |
+|---|---|---|---|---|
+| `GCN` new features | GCNConv | 22 | 10 | Test whether the rich features help a non-attention backbone |
 
-Holding λ=0.01 and epochs=500 constant, increasing N produces a near-monotonic improvement
-in AUROC and F1-micro up to N=8, with diminishing returns:
+**Axis 3 — Hidden-layer dimensions (the bottleneck fix from Section 9):**
 
-| N | AUROC | PR-AUC | F1 macro | F1 micro | Hier. viol. |
-|---|---|---|---|---|---|
-| 1 | 0.878 | 0.302 | 0.286 | 0.391 | 0.177 |
-| 2 | 0.879 | 0.318 | 0.296 | 0.396 | 0.181 |
-| 4 | 0.873 | 0.319 | 0.294 | 0.398 | 0.182 |
-| 8 | 0.870 | 0.330 | 0.308 | 0.402 | 0.194 |
+| Configuration | Operator | Conv dims | Global MLP | Runs |
+|---|---|---|---|---|
+| `GCN` new dimensions | GCNConv | scaled A/B/C | up to 256→256 | 9 |
+| `GATv2` new dims (Config A) | GATv2Conv | [32,48,64,96] | 128→138 | 12 |
+| `GATv2` new dims (Config B) | GATv2Conv | [64,96,128,160] | 256→256 | 12 |
 
-The gain from N=1 to N=8 is approximately +1.0 point of PR-AUC and +2.2 points of
-F1-macro, modest but consistent. The marginal benefit of doubling from N=4 to N=8 is
-smaller than from N=2 to N=4, suggesting that additional attention heads beyond N=8 would
-likely yield further diminishing returns; this was not tested because N=16 would have
-exceeded the GPU memory budget given the current hidden dimension. The intuition is that
-each head learns to specialise on a different chemical motif (aromatic ring detection,
-hydrogen-bond donor patterns, halogen neighbourhoods, etc.), and there are only so many
-useful structural patterns to learn given the limited dataset diversity.
+The dimension configurations refer to the sweep vectors defined during the architecture
+redesign. Config A is a conservative widening that primarily fixes the critical
+`global_mlp2` bottleneck (the original 63-dimensional layer being asked to decode 138
+labels); Config B is a more aggressive widening of both the convolution stack and the
+classification head. The earlier configurations all inherited the original SmellGCN head
+dimensions (`96→63`), which the dimension sweep was specifically designed to test.
 
-#### Effect of the Hierarchy Penalty Weight (λ)
+### 10.2 Best Results Per Configuration
 
-Holding N=8 and epochs=500 constant, the hierarchy penalty has a non-monotonic effect:
+The table below reports the single best run from each configuration sweep, selected by
+F1-macro on the 138 fine labels, alongside the best AUROC and PR-AUC observed anywhere in
+that configuration's sweep. The 12-label F1-macro is the best observed for configurations
+that recorded it.
 
-| λ | AUROC | PR-AUC | F1 macro | F1 macro-12 | Hier. viol. |
-|---|---|---|---|---|---|
-| 0.00 | 0.879 | 0.344 | 0.326 | 0.598 | 0.160 |
-| 0.01 | 0.870 | 0.330 | 0.308 | 0.593 | 0.194 |
-| 0.10 | 0.884 | 0.326 | 0.307 | 0.580 | 0.184 |
-| 0.30 | 0.876 | 0.310 | 0.282 | 0.583 | 0.176 |
-| 0.50 | 0.870 | 0.295 | 0.270 | 0.566 | 0.169 |
+| Configuration | Best F1-mac-138 | Best AUROC-138 | Best PR-AUC-138 | Best F1-mac-12 |
+|---|---|---|---|---|
+| GATv2 rich (22n/8e) | 0.3125 | 0.8905 | 0.3375 | — |
+| GATv2 base (9n/3e) | 0.2940 | 0.8735 | 0.3089 | 0.5962 |
+| GATv2 no edge features | 0.3034 | 0.8786 | 0.3184 | 0.5984 |
+| GCN new features (22n) | 0.3131 | 0.8797 | 0.3335 | 0.6117 |
+| GATv2 new dims — Config A | 0.3423 | 0.8875 | 0.3501 | 0.5943 |
+| GATv2 new dims — Config B | 0.3436 | 0.8828 | 0.3653 | 0.5990 |
+| **GCN new dimensions** | **0.3721** | **0.8885** | **0.4039** | 0.6064 |
 
-λ=0 (no penalty) maximises F1-macro because the classifier is free to optimise the raw
-multi-label objective without paying any cost for predicting children whose parents are
-not also active. The hierarchy violation rate at λ=0 is 0.160, which means roughly 16% of
-positive child predictions are not supported by a corresponding parent prediction —
-logically inconsistent but not penalised. Small positive λ values (0.01–0.1) shift the
-model toward more consistent predictions at a small cost in F1-macro. Larger values
-(0.3–0.5) over-regularise: the network learns to suppress confident child predictions to
-avoid the penalty, which depresses both F1-macro and PR-AUC without significantly improving
-the violation rate beyond what λ=0.01 achieves.
+### 10.3 Key Findings
 
-The non-monotonicity at λ=0.1 (AUROC peaks here at 0.884) is worth flagging: the larger
-penalty appears to act as a mild regulariser on the global head, sharpening discrimination
-even though it slightly hurts F1. This is the configuration that produces the best
-all-round operating point at 500 epochs.
+**The hidden-dimension fix is the single highest-impact change.** Across every axis
+explored, the largest performance jump came not from the convolution operator or the
+feature set, but from widening the classification head. The `GCN new dimensions`
+configuration reaches an F1-macro-138 of **0.3721** and a PR-AUC of **0.4039** — a +19%
+relative improvement in F1-macro and a +20% relative improvement in PR-AUC over the
+best rich-feature GATv2 run from Section 9 (0.3125 / 0.3375). This directly confirms the
+hypothesis from the architecture analysis: the original `96→63` head, with its final layer
+narrower than the 138-dimensional output it must decode, was the binding constraint on
+fine-label quality, not the convolution operator or the attention mechanism.
 
-#### Effect of Training Duration
+**Edge features contribute modestly but consistently.** Removing edge features from the
+GATv2 attention score (`GATv2 no edge`) drops best F1-macro-138 from 0.3125 to 0.3034 and
+PR-AUC from 0.3375 to 0.3184 — a real but small degradation. Edge features help the
+attention mechanism distinguish bond types, but they are far from the dominant factor. The
+12-label F1-macro is essentially unchanged (0.5984), indicating that edge information
+matters more for fine-grained discrimination than for coarse odour-family assignment.
 
-Holding N=8 and λ=0.01 constant:
+**The rich feature set matters more than edge features.** Reverting from 22 to 9 node
+features (`GATv2 base`) is the most damaging single-axis change among the original-dimension
+configurations, dropping F1-macro-138 to 0.2940 and PR-AUC to 0.3089. The custom RDKit
+node features — Gasteiger charges, ring-size membership, hydrogen-bond donor/acceptor
+flags — carry substantially more discriminative signal than the base atom/bond descriptors.
 
-| Epochs | AUROC | PR-AUC | F1 macro | F1 micro | Hier. viol. |
-|---|---|---|---|---|---|
-| 100 | 0.842 | 0.241 | 0.221 | 0.350 | 0.241 |
-| 500 | 0.870 | 0.330 | 0.308 | 0.402 | 0.194 |
-| 1000 | 0.884 | 0.333 | 0.306 | 0.405 | 0.123 |
+**GCN is competitive with GATv2 once dimensions are matched.** A notable and slightly
+counter-intuitive result: with the rich 22-feature set and the widened head, the GCN
+backbone matches or exceeds the GATv2 backbone. `GCN new features` (0.3131 F1-macro-138)
+already edges out the rich GATv2 reference, and `GCN new dimensions` is the best overall
+configuration. This suggests that for this dataset, the expressive bottleneck was never the
+aggregation operator — once node features are rich and the head is wide enough, the simpler
+GCN aggregation is sufficient, and the dynamic attention of GATv2 provides little additional
+benefit. This aligns with the broader observation in the GNN literature that on small,
+feature-rich molecular graphs, local structure dominates and elaborate attention yields
+diminishing returns.
 
-The 100-epoch checkpoint is clearly under-trained: PR-AUC is 9 points below the 500-epoch
-result, confirming that the cosine annealing schedule with T₀=50 has not completed enough
-warm restarts to converge. Between 500 and 1000 epochs, AUROC improves by +1.4 points and
-the hierarchy violation rate drops substantially (from 0.194 to 0.123), but F1-macro is
-essentially unchanged. The interpretation is that extra epochs allow the model to refine
-its probability calibration and learn the hierarchical structure more precisely (lower
-violations), but they do not push the per-label decision boundary further because the
-binding constraint on F1 is the per-label threshold calibration step rather than the
-model's raw discriminative capacity.
+**Widening helps GATv2 too, but less dramatically than GCN.** Both GATv2 dimension
+configurations (A: 0.3423, B: 0.3436) substantially outperform the original-dimension GATv2
+reference (0.3125), confirming the head fix generalises across operators. Config B's wider
+head delivers the better PR-AUC (0.3653 vs 0.3501), consistent with the expectation that the
+larger head benefits the harder fine-label decoding. However, neither GATv2 dimension
+configuration reaches the GCN new-dimensions result, reinforcing the finding above.
 
-This is consistent with the broader observation that the threshold calibration step
-recovers most of the achievable F1 once AUROC exceeds ~0.86; further AUROC gains help
-ranking but not absolute classification accuracy at any single threshold.
+**Longer training matters once the head is wide enough.** In the dimension-scaled
+configurations, the top runs cluster at 1000 epochs rather than 500 — a reversal of the
+Section 9.8 finding that 500 epochs was near-optimal. With the original narrow head, the
+model saturated early because the bottleneck capped representational quality regardless of
+training length. With a wider head, the additional capacity can be productively used by
+extended training, so the 1000-epoch runs pull ahead.
 
-#### Interaction Effects
+### 10.4 Synthesis
 
-Two interactions are noteworthy:
+Ordering the architectural axes by their measured impact on F1-macro-138:
 
-**N × λ.** At λ=0, all four head counts produce competitive F1-macro (within 1.5 points
-of each other), but at λ ≥ 0.1, larger N values are systematically better. The explanation
-is that more attention heads provide more flexibility for the network to satisfy the
-hierarchy constraint without sacrificing per-label accuracy.
+1. **Hidden-layer dimensions (head width)** — largest effect; fixing the `63 < 138`
+   bottleneck moved F1-macro from ~0.31 to 0.37.
+2. **Node feature richness** — second largest; reverting 22→9 features cost ~0.02 F1-macro.
+3. **Edge features** — small but consistent; ~0.01 F1-macro.
+4. **Convolution operator (GCN vs GATv2)** — negligible once features and dimensions are
+   matched; GCN was marginally ahead in the best configuration.
 
-**N × epochs.** N=2 reaches its peak F1-macro by 500 epochs, while N=8 continues to
-improve slightly between 500 and 1000 epochs. Larger models benefit more from longer
-training in this regime, consistent with standard scaling intuition.
-
-**λ × epochs.** The hierarchy violation rate at λ=0.01 drops from 0.194 (500 epochs) to
-0.123 (1000 epochs) — a 37% relative reduction. At λ=0, the violation rate stays
-essentially flat across epochs (0.160 → 0.181). The penalty needs training time to
-propagate its effect through the gradient flow, which is direct empirical confirmation
-that the penalty is functioning as intended.
-
-#### Pareto Frontier
-
-Three configurations dominate the others on at least one metric and are not dominated on
-any other:
-
-- **(N=8, λ=0, 500ep)** — Pareto-optimal for F1-macro and PR-AUC.
-- **(N=8, λ=0.01, 1000ep)** — Pareto-optimal for AUROC and hierarchy compliance.
-- **(N=2, λ=0.1, 500ep)** — Pareto-optimal for the AUROC vs. training-cost trade-off.
-
-All other tested configurations are dominated by at least one of these three.
-
-#### Computational Cost
-
-Wall-clock training time on the available Colab GPU scales roughly linearly with N
-(per-epoch) and linearly with epochs, with no significant change as a function of λ. The
-1000-epoch N=8 configuration takes approximately 2.5× the time of the 500-epoch N=2
-configuration. Given that the AUROC gain from this additional compute is only +0.4 points
-and the F1-macro is essentially unchanged, the 500-epoch N=2 or N=8 configurations are
-preferable for iteration during development; the 1000-epoch run was reserved for the
-final paper result where the lower hierarchy violation rate justified the additional cost.
-
-#### Selected Operating Point for the Paper
-
-The configuration reported as the headline result in the paper is **(N=8, λ=0.01, 1000ep)**.
-This choice prioritises AUROC and hierarchical consistency over raw F1-macro on the
-138-label level, reflecting the scientific objective of the work: demonstrating that the
-HMCN-F architecture produces logically consistent multi-label predictions, not merely that
-it maximises a per-label score. The 0.326 F1-macro from the λ=0 configuration is reported
-as a secondary result with explicit acknowledgement that it comes at the cost of a 30%
-higher hierarchy violation rate.
-
----
+The practical conclusion for the next phase is clear: capacity allocation in the
+classification head, not the choice of message-passing operator, is where the remaining
+performance gains lie. The per-label threshold calibration step (Section 9.8) remains the
+other binding constraint, and the two are complementary — a wider head produces better
+calibrated logits, but the post-hoc threshold optimisation still determines how much of that
+quality is realised in the final F1 scores.
