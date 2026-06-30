@@ -117,8 +117,6 @@ Three initial analyses were run on the small dataset:
 
 ## 4. Graph Representation & GNN Modelling
 
-*(This is the primary focus of Vinícius's work in the internship.)*
-
 ### Why Represent Molecules as Graphs?
 
 Fingerprints and descriptors are fixed-length vectors computed by predetermined algorithms — they compress molecular structure through a lens the algorithm designer chose, not one the model can learn. Key limitations:
